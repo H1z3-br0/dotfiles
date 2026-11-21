@@ -1,0 +1,33 @@
+[user]
+	name = CTF Player
+	email = ctf@localhost
+[init]
+	defaultBranch = main
+[core]
+	editor = vim
+	pager = less -FRX
+	autocrlf = input
+[color]
+	ui = auto
+[alias]
+	st = status -sb
+	co = checkout
+	br = branch
+	ci = commit
+	lg = log --oneline --graph --decorate --all -30
+	last = log -1 --stat
+	unstage = reset HEAD --
+	df = diff --stat
+[push]
+	autoSetupRemote = true
+[fetch]
+	prune = true
+[http]
+	postBuffer = 524288000
+[filter "lfs"]
+	clean = git-lfs clean -- %f
+	smudge = git-lfs smudge -- %f
+	process = git-lfs filter-process
+	required = true
+[include]
+	path = ~/.gitconfig.local

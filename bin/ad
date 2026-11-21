@@ -1,0 +1,347 @@
+#!/usr/bin/env bash
+# ad — small Attack-Defence / CTF helper.
+# Defensive ops only: inspect ports, tail logs, open shells, keep notes.
+set -u
+
+VERSION="1.0"
+
+usage() {
+    cat <<'EOF'
+ad — помощник для Attack-Defence CTF
+
+Основное:
+  ad tmux [session]        открыть готовую раскладку tmux (по умолчанию: ad)
+  ad ssh HOST [args...]    ssh с keepalive
+  ad scan HOST             nmap (или быстрый перебор портов)
+  ad ports [HOST]          локальные слушающие порты / скан HOST
+  ad check HOST PORT...    проверить TCP-порты через nc
+  ad serve [PORT]          HTTP-сервер в текущей папке (по умолчанию 8000)
+  ad listen [PORT]         nc-листенер (по умолчанию 4444)
+  ad ip                    показать локальные IP
+
+Эксплуатация / защита:
+  ad watch FILE            tail -Fn 200 FILE
+  ad logs SERVICE          journalctl -u SERVICE -f (или syslog)
+  ad restart SERVICE       перезапустить сервис (systemctl/service)
+  ad status                упавшие сервисы + запущенные юниты
+  ad grep PATTERN [PATH]   рекурсивный поиск
+  ad flag [PATH]           поиск флагов в файлах
+  ad extract ARCHIVE       распаковать архив
+  ad note [TEXT]           записать заметку в notes.md / открыть редактор
+  ad env                   версии инструментов и окружение
+
+Переменные:
+  AD_HOST=user@host        цель для окна target в `ad tmux`
+  AD_LOG=/path/to/log      файл для окна logs в `ad tmux`
+  CTF_ROOT=~/ctf           рабочая папка для заметок
+
+Пример:
+  ad tmux
+  AD_HOST=player@10.10.10.10 AD_LOG=/var/log/nginx/error.log ad tmux
+  ad scan 10.10.10.10
+  ad check 10.10.10.10 22 80 443
+EOF
+}
+
+die() {
+    printf 'ad: %s\n' "$*" >&2
+    exit 1
+}
+
+need() {
+    command -v "$1" >/dev/null 2>&1 || die "не найдено: $1"
+}
+
+local_ip() {
+    if command -v ip >/dev/null 2>&1; then
+        ip -brief addr show scope global 2>/dev/null | awk '{print $3}'
+    elif command -v ifconfig >/dev/null 2>&1; then
+        ifconfig | awk '/inet / && $2 != "127.0.0.1" {print $2}'
+    else
+        hostname -I 2>/dev/null
+    fi
+}
+
+cmd_tmux() {
+    need tmux
+    local session="${1:-ad}"
+    local editor=""
+    local notes="$PWD/notes.md"
+
+    if tmux has-session -t "$session" 2>/dev/null; then
+        printf 'ad: сессия %s уже существует, подключаюсь\n' "$session"
+        if [ -n "${TMUX:-}" ]; then
+            exec tmux switch-client -t "$session"
+        else
+            exec tmux attach -t "$session"
+        fi
+    fi
+
+    if command -v nvim >/dev/null 2>&1; then
+        editor="nvim"
+    elif command -v vim >/dev/null 2>&1; then
+        editor="vim"
+    fi
+
+    [ -f "$notes" ] || printf '# AD notes\n\n' > "$notes"
+
+    tmux new-session -d -s "$session" -n ops -c "$PWD"
+    tmux split-window -h -t "$session:ops" -c "$PWD"
+    tmux split-window -v -t "$session:ops.1" -c "$PWD"
+    tmux select-pane -t "$session:ops.0"
+
+    if [ -n "$editor" ]; then
+        tmux new-window -t "$session" -n notes -c "$PWD" "$editor notes.md"
+    fi
+
+    if [ -n "${AD_HOST:-}" ]; then
+        tmux new-window -t "$session" -n target -c "$PWD" "ssh $(printf '%q' "$AD_HOST")"
+    fi
+
+    if [ -n "${AD_LOG:-}" ]; then
+        tmux new-window -t "$session" -n logs -c "$PWD" "tail -Fn 200 $(printf '%q' "$AD_LOG")"
+    fi
+
+    tmux select-window -t "$session:ops"
+    if [ -n "${TMUX:-}" ]; then
+        exec tmux switch-client -t "$session"
+    else
+        exec tmux attach -t "$session"
+    fi
+}
+
+cmd_ssh() {
+    [ $# -ge 1 ] || die "usage: ad ssh HOST [args...]"
+    need ssh
+    exec ssh -o ServerAliveInterval=30 -o ServerAliveCountMax=3 "$@"
+}
+
+cmd_check() {
+    [ $# -ge 2 ] || die "usage: ad check HOST PORT [PORT...]"
+    need nc
+    local host="$1"
+    shift
+    local port
+    for port in "$@"; do
+        if nc -z -w 2 "$host" "$port" 2>/dev/null; then
+            printf 'open   %s:%s\n' "$host" "$port"
+        else
+            printf 'closed %s:%s\n' "$host" "$port"
+        fi
+    done
+}
+
+cmd_scan() {
+    [ $# -ge 1 ] || die "usage: ad scan HOST"
+    local host="$1"
+    if command -v nmap >/dev/null 2>&1; then
+        nmap -Pn -sT -T4 --top-ports 1000 --version-light "$host"
+        return
+    fi
+    need nc
+    printf 'ad: nmap не найден, проверяю частые порты\n'
+    local ports="21 22 23 25 53 80 110 139 143 443 445 993 995 1433 1521 2049 2375 3000 3306 3389 4444 5000 5432 5900 6379 8000 8080 8443 8888 9000 9200 10000 11211 27017"
+    local port
+    for port in $ports; do
+        if nc -z -w 1 "$host" "$port" 2>/dev/null; then
+            printf 'open   %s:%s\n' "$host" "$port"
+        fi
+    done
+}
+
+cmd_ports() {
+    if [ $# -ge 1 ]; then
+        cmd_scan "$1"
+        return
+    fi
+    if command -v lsof >/dev/null 2>&1; then
+        lsof -nP -iTCP -sTCP:LISTEN
+    elif command -v ss >/dev/null 2>&1; then
+        ss -tlnp
+    elif command -v netstat >/dev/null 2>&1; then
+        netstat -tlnp 2>/dev/null || netstat -an | grep -i listen
+    else
+        die "нет lsof/ss/netstat"
+    fi
+}
+
+cmd_serve() {
+    local port="${1:-8000}"
+    local ip
+    ip="$(local_ip | head -n1)"
+    printf 'ad: HTTP на http://%s:%s/ (Ctrl-C — остановить)\n' "${ip:-0.0.0.0}" "$port"
+    if command -v python3 >/dev/null 2>&1; then
+        exec python3 -m http.server "$port" --bind 0.0.0.0
+    fi
+    need python
+    exec python -m SimpleHTTPServer "$port"
+}
+
+cmd_listen() {
+    local port="${1:-4444}"
+    need nc
+    printf 'ad: слушаю TCP %s (Ctrl-C — остановить)\n' "$port"
+    if [ "$(uname -s)" = "Darwin" ]; then
+        exec nc -lv "$port"
+    elif nc -h 2>&1 | grep -qi 'openbsd'; then
+        exec nc -lvnp "$port"
+    else
+        exec nc -lvp "$port"
+    fi
+}
+
+cmd_watch() {
+    [ $# -ge 1 ] || die "usage: ad watch FILE"
+    tail -Fn 200 "$1"
+}
+
+cmd_logs() {
+    [ $# -ge 1 ] || die "usage: ad logs SERVICE"
+    if command -v journalctl >/dev/null 2>&1; then
+        journalctl -u "$1" -f -n 200 --no-pager
+    elif [ -f /var/log/syslog ]; then
+        tail -Fn 200 /var/log/syslog
+    elif [ -f /var/log/messages ]; then
+        tail -Fn 200 /var/log/messages
+    else
+        die "не найден journalctl/syslog"
+    fi
+}
+
+cmd_restart() {
+    [ $# -ge 1 ] || die "usage: ad restart SERVICE"
+    if command -v systemctl >/dev/null 2>&1; then
+        sudo systemctl restart "$1" && sudo systemctl status --no-pager -l "$1"
+    elif command -v service >/dev/null 2>&1; then
+        sudo service "$1" restart
+    else
+        die "не найден systemctl/service"
+    fi
+}
+
+cmd_status() {
+    if command -v systemctl >/dev/null 2>&1; then
+        systemctl --failed --no-pager
+        printf '\n'
+        systemctl list-units --type=service --state=running --no-pager | head -40
+    elif command -v service >/dev/null 2>&1; then
+        service --status-all
+    else
+        die "не найден systemctl/service"
+    fi
+}
+
+cmd_grep() {
+    [ $# -ge 1 ] || die "usage: ad grep PATTERN [PATH]"
+    local pattern="$1"
+    local path="${2:-.}"
+    if command -v rg >/dev/null 2>&1; then
+        rg -n --hidden --glob '!.git' -- "$pattern" "$path"
+    else
+        grep -RInE --exclude-dir=.git --exclude-dir=node_modules -- "$pattern" "$path"
+    fi
+}
+
+cmd_flag() {
+    local path="${1:-.}"
+    local pattern='flag\{[^}]+\}|FLAG\{[^}]+\}|CTF\{[^}]+\}|[A-Za-z0-9_]{31}='
+    printf 'ad: ищу флаги в %s\n' "$path"
+    if command -v rg >/dev/null 2>&1; then
+        rg -n --hidden --glob '!.git' -e "$pattern" "$path"
+    else
+        grep -RInE --exclude-dir=.git --exclude-dir=node_modules -- "$pattern" "$path"
+    fi
+}
+
+cmd_extract() {
+    [ $# -ge 1 ] || die "usage: ad extract ARCHIVE"
+    case "$1" in
+        *.tar.gz|*.tgz)   tar xzf "$1" ;;
+        *.tar.bz2|*.tbz2) tar xjf "$1" ;;
+        *.tar.xz|*.txz)   tar xJf "$1" ;;
+        *.tar)            tar xf "$1" ;;
+        *.zip)            unzip "$1" ;;
+        *.7z)             7z x "$1" ;;
+        *.rar)            unrar x "$1" ;;
+        *.gz)             gunzip "$1" ;;
+        *) die "неизвестный тип архива: $1" ;;
+    esac
+}
+
+cmd_note() {
+    if [ $# -eq 0 ]; then
+        if [ -n "${EDITOR:-}" ]; then
+            "$EDITOR" notes.md
+        elif command -v nvim >/dev/null 2>&1; then
+            nvim notes.md
+        else
+            vim notes.md
+        fi
+        return
+    fi
+    printf '\n## %s\n\n%s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >> notes.md
+    printf 'ad: заметка добавлена в notes.md\n'
+}
+
+cmd_env() {
+    printf 'date:    %s\n' "$(date '+%Y-%m-%d %H:%M:%S %Z')"
+    printf 'user:    %s@%s\n' "${USER:-?}" "$(hostname 2>/dev/null || echo '?')"
+    printf 'kernel:  %s\n' "$(uname -srm)"
+    printf 'shell:   %s\n' "${SHELL:-?}"
+    printf 'cwd:     %s\n' "$PWD"
+    printf 'ctf:     %s\n' "${CTF_ROOT:-$HOME/ctf}"
+    if command -v tmux >/dev/null 2>&1; then
+        printf 'tmux:    %s\n' "$(tmux -V)"
+    else
+        printf 'tmux:    нет\n'
+    fi
+    if command -v python3 >/dev/null 2>&1; then
+        printf 'python:  %s\n' "$(python3 --version 2>&1)"
+    else
+        printf 'python:  нет\n'
+    fi
+    if command -v gdb >/dev/null 2>&1; then
+        printf 'gdb:     %s\n' "$(gdb --version 2>/dev/null | head -n1)"
+    else
+        printf 'gdb:     нет\n'
+    fi
+    if command -v nmap >/dev/null 2>&1; then
+        printf 'nmap:    %s\n' "$(nmap --version 2>/dev/null | head -n1)"
+    else
+        printf 'nmap:    нет\n'
+    fi
+    printf 'ip:      %s\n' "$(local_ip | tr '\n' ' ')"
+    if [ -n "${TMUX:-}" ]; then
+        printf 'tmux:    внутри сессии %s\n' "$(tmux display-message -p '#S' 2>/dev/null)"
+    fi
+}
+
+main() {
+    [ $# -ge 1 ] || { usage; exit 0; }
+    local cmd="$1"
+    shift
+    case "$cmd" in
+        help|-h|--help) usage ;;
+        version|--version) printf 'ad %s\n' "$VERSION" ;;
+        tmux) cmd_tmux "$@" ;;
+        ssh) cmd_ssh "$@" ;;
+        scan) cmd_scan "$@" ;;
+        ports) cmd_ports "$@" ;;
+        check) cmd_check "$@" ;;
+        serve) cmd_serve "$@" ;;
+        listen) cmd_listen "$@" ;;
+        ip) local_ip ;;
+        watch) cmd_watch "$@" ;;
+        logs) cmd_logs "$@" ;;
+        restart) cmd_restart "$@" ;;
+        status) cmd_status ;;
+        grep) cmd_grep "$@" ;;
+        flag) cmd_flag "$@" ;;
+        extract) cmd_extract "$@" ;;
+        note) cmd_note "$@" ;;
+        env) cmd_env ;;
+        *) die "неизвестная команда: $cmd (ad help)" ;;
+    esac
+}
+
+main "$@"

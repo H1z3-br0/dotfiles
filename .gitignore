@@ -1,0 +1,7 @@
+.DS_Store
+*.swp
+*.swo
+notes.md
+
+# Local exploit notes/guides are not part of the dotfiles.
+s4dfarm-sploits.md

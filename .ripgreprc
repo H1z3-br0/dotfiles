@@ -1,0 +1,8 @@
+--smart-case
+--hidden
+--glob=!.git/*
+--glob=!node_modules/*
+--glob=!__pycache__/*
+--glob=!*.pyc
+--max-columns=200
+--max-columns-preview
